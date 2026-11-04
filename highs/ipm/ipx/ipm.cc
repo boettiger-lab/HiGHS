@@ -52,14 +52,34 @@ void IPM::Driver(KKTSolver* kkt, Iterate* iterate, Info* info) {
     info_ = info;
     num_bad_iter_ = 0;
 
+    // The last iterate that met the IPM feasibility and optimality tolerances.
+    // With crossover requested, termination also needs the residuals from
+    // dropping to complementarity to be small, so the IPM can pass such an
+    // iterate, lose numerical accuracy and diverge. The divergence test below
+    // would then read the exploding dual objective as primal infeasibility of
+    // a problem whose optimum it has already found.
+    bool have_tolerant_iterate = false;
+    Vector tol_x, tol_xl, tol_xu, tol_y, tol_zl, tol_zu;
+
     while (true) {
         if (iterate->term_crit_reached()) {
             info->status_ipm = IPX_STATUS_optimal;
             break;
         }
+        if (iterate->feasible() && iterate->optimal()) {
+            have_tolerant_iterate = true;
+            tol_x = iterate->x(); tol_xl = iterate->xl(); tol_xu = iterate->xu();
+            tol_y = iterate->y(); tol_zl = iterate->zl(); tol_zu = iterate->zu();
+        }
         if (num_bad_iter_ >= 5 ||
             (best_complementarity_ > 0.0 &&
             iterate_->complementarity() > kDivergeTol * best_complementarity_)) {
+            if (have_tolerant_iterate) {
+                // Return the iterate that met the tolerances, for crossover.
+                iterate->Initialize(tol_x, tol_xl, tol_xu, tol_y, tol_zl, tol_zu);
+                info->status_ipm = IPX_STATUS_imprecise;
+                break;
+            }
             // No progress in reducing the complementarity gap.
             // Check if model seems to be primal or dual infeasible.
             bool dualized = iterate_->model().dualized();
