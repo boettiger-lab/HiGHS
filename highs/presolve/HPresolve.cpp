@@ -961,6 +961,8 @@ void HPresolve::shrinkProblem(HighsPostsolveStack& postsolve_stack) {
   impliedRowBounds.shrink(newRowIndex, model->num_row_);
   impliedDualRowBounds.shrink(newColIndex, model->num_col_);
 
+  rowMaxAbsCoef.assign(model->num_row_, -1.0);
+
   for (size_t i = 0; i != Avalue.size(); ++i) {
     if (Avalue[i] == 0) continue;
     assert(newColIndex[Acol[i]] != -1);
@@ -2094,6 +2096,10 @@ void HPresolve::addToMatrix(const HighsInt row, const HighsInt col,
 
     link(pos);
 
+    if (static_cast<size_t>(row) < rowMaxAbsCoef.size() &&
+        rowMaxAbsCoef[row] >= 0.0)
+      rowMaxAbsCoef[row] = std::max(rowMaxAbsCoef[row], std::abs(val));
+
     // remove implied bounds on row duals that where implied by this column's
     // dual constraint
     resetRowDualImpliedBoundsDerivedFromCol(col);
@@ -2124,6 +2130,9 @@ void HPresolve::addToMatrix(const HighsInt row, const HighsInt col,
       impliedRowBounds.remove(row, col, Avalue[pos]);
       impliedDualRowBounds.remove(col, row, Avalue[pos]);
       Avalue[pos] = sum;
+      if (static_cast<size_t>(row) < rowMaxAbsCoef.size() &&
+          rowMaxAbsCoef[row] >= 0.0)
+        rowMaxAbsCoef[row] = std::max(rowMaxAbsCoef[row], std::abs(sum));
       // value not zero, add new contributions and locks with opposite sign
       impliedRowBounds.add(row, col, Avalue[pos]);
       impliedDualRowBounds.add(col, row, Avalue[pos]);
@@ -2551,6 +2560,18 @@ void HPresolve::getRowPositions(HighsInt row,
 
 void HPresolve::storeRow(HighsInt row) { getRowPositions(row, rowpositions); }
 
+double HPresolve::getRowMaxAbsCoef(HighsInt row) {
+  if (static_cast<size_t>(row) >= rowMaxAbsCoef.size())
+    rowMaxAbsCoef.resize(row + 1, -1.0);
+  if (rowMaxAbsCoef[row] < 0.0) {
+    double maxAbs = 0.0;
+    for (const auto& nz : getRowVector(row))
+      maxAbs = std::max(maxAbs, std::abs(nz.value()));
+    rowMaxAbsCoef[row] = maxAbs;
+  }
+  return rowMaxAbsCoef[row];
+}
+
 HighsTripletPositionSlice HPresolve::getStoredRow() const {
   return HighsTripletPositionSlice(Acol.data(), Avalue.data(),
                                    rowpositions.data(), rowpositions.size());
@@ -2588,6 +2609,7 @@ bool HPresolve::okFromCSC(const std::vector<double>& Aval,
   HighsInt nnz = static_cast<HighsInt>(Aval.size());
 
   Avalue = Aval;
+  rowMaxAbsCoef.assign(rowroot.size(), -1.0);
   if (!okReserve(Acol, nnz)) return false;
   if (!okReserve(Arow, nnz)) return false;
 
@@ -2651,6 +2673,7 @@ bool HPresolve::okFromCSR(const std::vector<double>& ARval,
   HighsInt nnz = static_cast<HighsInt>(ARval.size());
 
   Avalue = ARval;
+  rowMaxAbsCoef.assign(rowroot.size(), -1.0);
   if (!okReserve(Acol, nnz)) return false;
   if (!okReserve(Arow, nnz)) return false;
   //  entries.reserve(nnz);
@@ -2833,6 +2856,7 @@ HPresolve::Result HPresolve::transformColumn(
     double val = Avalue[coliter];
     Avalue[coliter] *= scale;
     HighsInt row = Arow[coliter];
+    invalidateRowMaxAbsCoef(row);
     double rowConstant = val * constant;
     if (model->row_lower_[row] != -kHighsInf)
       model->row_lower_[row] -= rowConstant;
@@ -2879,6 +2903,7 @@ void HPresolve::scaleStoredRow(HighsInt row, double scale, bool integral) {
       unlink(rowpositions[j]);
   }
 
+  invalidateRowMaxAbsCoef(row);
   impliedRowBounds.sumScaled(row, scale);
   if (scale < 0) {
     std::swap(rowDualLower[row], rowDualUpper[row]);
@@ -4691,6 +4716,32 @@ HPresolve::Result HPresolve::dualFixing(HighsPostsolveStack& postsolve_stack,
     // check lhs and rhs for finiteness
     bool lhsFinite = model->row_lower_[row] != -kHighsInf;
     bool rhsFinite = model->row_upper_[row] != kHighsInf;
+
+    // Necessary condition for any candidate below: a binary y with coefficient
+    // a makes the row redundant at y = 0 only if the residual activity bound
+    // (which drops a*1 from the upper bound when a > 0, or from the lower bound
+    // when a < 0) meets the row side, i.e. |a| >= sumUpperOrig - rhs - feastol
+    // (rhs side) and |a| >= lhs - feastol - sumLowerOrig (lhs side). Infinite
+    // contributions cannot be removed by a binary. Checking this against an
+    // upper bound on the row's largest |coefficient| avoids scanning the whole
+    // row for every column; without it dual fixing is quadratic on rows that
+    // hold every column (e.g. a budget row of a knapsack-type MIP).
+    {
+      const double maxAbs = getRowMaxAbsCoef(row);
+      auto impossible = [&](double need) {
+        return maxAbs < need - 1e-9 * std::max(1.0, std::abs(need));
+      };
+      if (rhsFinite &&
+          (impliedRowBounds.getNumInfSumUpperOrig(row) != 0 ||
+           impossible(impliedRowBounds.getSumUpperOrig(row) -
+                      model->row_upper_[row] - primal_feastol)))
+        return Result::kOk;
+      if (lhsFinite &&
+          (impliedRowBounds.getNumInfSumLowerOrig(row) != 0 ||
+           impossible(model->row_lower_[row] - primal_feastol -
+                      impliedRowBounds.getSumLowerOrig(row))))
+        return Result::kOk;
+    }
 
     // use storeRow and getStoredRow since getRowVector's rowroot[row] would be
     // overwritten by subsequent findNonZero calls, which would produce

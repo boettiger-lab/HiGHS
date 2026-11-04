@@ -59,6 +59,10 @@ class HPresolve {
 
   // length of rows and columns
   std::vector<HighsInt> rowsize;
+  // over-estimate of the largest |coefficient| in each row; negative means
+  // unknown (recomputed on demand). Kept as an upper bound when coefficients
+  // change, so it can only be used for necessary conditions.
+  std::vector<double> rowMaxAbsCoef;
   std::vector<HighsInt> rowsizeInteger;
   std::vector<HighsInt> rowsizeImplInt;
   std::vector<HighsInt> colsize;
@@ -276,6 +280,13 @@ class HPresolve {
                        std::vector<HighsInt>& myrowpositions) const;
 
   void storeRow(HighsInt row);
+
+  double getRowMaxAbsCoef(HighsInt row);
+
+  void invalidateRowMaxAbsCoef(HighsInt row) {
+    if (static_cast<size_t>(row) < rowMaxAbsCoef.size())
+      rowMaxAbsCoef[row] = -1.0;
+  }
 
   HighsTripletPositionSlice getStoredRow() const;
 
