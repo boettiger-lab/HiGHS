@@ -188,6 +188,17 @@ class HighsCliqueTable {
 
   int64_t& getNumNeighbourhoodQueries() { return numNeighbourhoodQueries; }
 
+  bool cliqueNeighbourhoodByEnumeration(std::vector<HighsInt>& neighbourhoodInds,
+                                        int64_t& numQueries, CliqueVar v,
+                                        const std::vector<HighsInt>& pos,
+                                        HighsInt qStart, HighsInt N) const;
+
+  HighsInt partitionNeighbourhoodTracked(std::vector<HighsInt>& neighbourhoodInds,
+                                         int64_t& numQueries, CliqueVar v,
+                                         std::vector<CliqueVar>& clqVars,
+                                         std::vector<HighsInt>& pos,
+                                         HighsInt start, HighsInt N) const;
+
   HighsInt partitionNeighbourhood(std::vector<HighsInt>& neighbourhoodInds,
                                   int64_t& numNeighbourhoodqueries, CliqueVar v,
                                   CliqueVar* q, HighsInt N) const;
