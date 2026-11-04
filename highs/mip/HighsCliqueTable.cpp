@@ -1088,46 +1088,90 @@ void HighsCliqueTable::cliquePartition(const std::vector<double>& objective,
                               (2 * v2.val - 1) * objective[v2.col];
                      });
 
-  std::vector<HighsInt> neighbourhoodInds;
-  neighbourhoodInds.reserve(clqVars.size());
+  // Greedy clique cover in priority order: each part starts at the
+  // highest-priority variable not yet covered, and is extended by its
+  // neighbours in priority order. The variables are not moved while this
+  // runs; earlier code swapped each part to the front of the remaining
+  // variables and re-sorted the displaced range at every part, which is
+  // O(N^2 log N) when there are many small cliques. The parts are the same up
+  // to the order of variables with equal priority.
+  const HighsInt numClqVars = clqVars.size();
+  std::vector<HighsInt> rank(numcliquesvar.size(), -1);
+  for (HighsInt r = 0; r < numClqVars; ++r) rank[clqVars[r].index()] = r;
+  std::vector<uint8_t> taken(numClqVars, 0);
+  HighsInt numUntaken = numClqVars;
 
-  HighsInt numClqVars = clqVars.size();
-  // positions of the clique variables (see the overload above)
-  std::vector<HighsInt> pos(numcliquesvar.size(), -1);
-  for (HighsInt i = 0; i < numClqVars; ++i) pos[clqVars[i].index()] = i;
+  std::vector<CliqueVar> ordered;
+  ordered.reserve(numClqVars);
   partitionStart.clear();
-  partitionStart.reserve(clqVars.size());
-  HighsInt extensionEnd = numClqVars;
-  partitionStart.push_back(0);
-  HighsInt lastSwappedIndex = 0;
-  for (HighsInt i = 0; i < numClqVars; ++i) {
-    if (i == extensionEnd) {
-      partitionStart.push_back(i);
-      extensionEnd = numClqVars;
-      if (lastSwappedIndex >= i) {
-        pdqsort_branchless(clqVars.begin() + i,
-                           clqVars.begin() + lastSwappedIndex + 1,
-                           [&](CliqueVar v1, CliqueVar v2) {
-                             return (2 * v1.val - 1) * objective[v1.col] >
-                                    (2 * v2.val - 1) * objective[v2.col];
-                           });
-        for (HighsInt k = i; k <= lastSwappedIndex; ++k)
-          pos[clqVars[k].index()] = k;
-      }
-      lastSwappedIndex = 0;
-    }
-    CliqueVar v = clqVars[i];
-    HighsInt extensionStart = i + 1;
-    extensionEnd = partitionNeighbourhoodTracked(
-                       neighbourhoodInds, numNeighbourhoodQueries, v, clqVars,
-                       pos, extensionStart, extensionEnd - extensionStart) +
-                   extensionStart;
-    if (!neighbourhoodInds.empty())
-      lastSwappedIndex =
-          std::max(neighbourhoodInds.back() + extensionStart, lastSwappedIndex);
-  }
+  partitionStart.reserve(numClqVars + 1);
+  std::vector<HighsInt> ext, next;
 
+  // untaken neighbours of v ranked after r, ascending by rank
+  auto firstNeighbourhood = [&](CliqueVar v, HighsInt r) {
+    ext.clear();
+    if (numCliques(v) == 0) return;
+    int64_t work = 0;
+    bool tooLarge = false;
+    auto countWork = [&](HighsInt cliqueid) {
+      work += cliques[cliqueid].end - cliques[cliqueid].start;
+      tooLarge = work > numUntaken;
+      return tooLarge;
+    };
+    invertedHashList[v.index()].for_each(
+        [&](HighsInt cliqueid, HighsInt) { return countWork(cliqueid); });
+    if (!tooLarge)
+      invertedHashListSizeTwo[v.index()].for_each(
+          [&](HighsInt cliqueid) { return countWork(cliqueid); });
+    if (tooLarge) {
+      int64_t counted = 0;  // already charged by the caller
+      for (HighsInt s = r + 1; s < numClqVars; ++s)
+        if (!taken[s] && haveCommonClique(counted, v, clqVars[s]))
+          ext.push_back(s);
+      return;
+    }
+    auto collect = [&](HighsInt cliqueid) {
+      for (HighsInt k = cliques[cliqueid].start; k != cliques[cliqueid].end;
+           ++k) {
+        CliqueVar u = cliqueentries[k];
+        if (u == v) continue;
+        HighsInt s = rank[u.index()];
+        if (s > r && !taken[s]) ext.push_back(s);
+      }
+    };
+    invertedHashList[v.index()].for_each(
+        [&](HighsInt cliqueid, HighsInt) { collect(cliqueid); });
+    invertedHashListSizeTwo[v.index()].for_each(
+        [&](HighsInt cliqueid) { collect(cliqueid); });
+    pdqsort(ext.begin(), ext.end());
+    ext.erase(std::unique(ext.begin(), ext.end()), ext.end());
+  };
+
+  for (HighsInt r = 0; r < numClqVars; ++r) {
+    if (taken[r]) continue;
+    partitionStart.push_back(static_cast<HighsInt>(ordered.size()));
+    CliqueVar v = clqVars[r];
+    taken[r] = 1;
+    --numUntaken;
+    ordered.push_back(v);
+    // the scan this replaces queried every remaining variable
+    numNeighbourhoodQueries += numUntaken;
+    firstNeighbourhood(v, r);
+    while (!ext.empty()) {
+      HighsInt w = ext[0];
+      taken[w] = 1;
+      --numUntaken;
+      ordered.push_back(clqVars[w]);
+      next.clear();
+      for (size_t k = 1; k < ext.size(); ++k)
+        if (haveCommonClique(numNeighbourhoodQueries, clqVars[w],
+                             clqVars[ext[k]]))
+          next.push_back(ext[k]);
+      ext.swap(next);
+    }
+  }
   partitionStart.push_back(numClqVars);
+  clqVars.swap(ordered);
 }
 
 bool HighsCliqueTable::foundCover(HighsDomain& globaldom, CliqueVar v1,
